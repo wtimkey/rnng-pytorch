@@ -392,7 +392,8 @@ def main(arguments):
     parser.add_argument('--jobs', type=int, default=-1)
     args = parser.parse_args(arguments)
     if args.jobs == -1:
-        args.jobs = len(os.sched_getaffinity(0))
+        #args.jobs = len(os.sched_getaffinity(0))
+        args.jobs = 1
     # np.random.seed(3435)
     get_data(args)
 

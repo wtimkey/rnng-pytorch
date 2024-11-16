@@ -5,6 +5,7 @@ import random
 import torch
 import torch.nn.functional as F
 from nltk import Tree
+import re
 
 def get_in_order_actions(line, subword_tokenized=False):
   def get_actions_recur(tree, actions=[]):

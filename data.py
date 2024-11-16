@@ -425,6 +425,7 @@ class Dataset(object):
     self.num_batches = len(batches)
 
     if shuffle:
+        batches = np.array(batches, dtype=object)
         batches = np.random.permutation(batches)
 
     if self.random_unk:

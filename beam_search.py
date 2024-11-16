@@ -53,9 +53,11 @@ parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'],
                     help='If "cuda", GPU number --gpu is used.')
 parser.add_argument('--seed', default=3435, type=int)
+parser.add_argument('--temp', default=1.0, type=float)
 parser.add_argument('--fp16', action='store_true')
 parser.add_argument('--max_length_diff', default=20, type=int,
                     help='Maximum sentence length difference in a single batch does not exceed this.')
+parser.add_argument('--sort_by_preword_probs', action='store_true')
 
 def load_model(checkpoint, action_dict, vocab):
   if 'model_state_dict' in checkpoint:
@@ -115,18 +117,30 @@ def main(args):
     all_parses.extend(orig_order_parses)
     all_surprisals.extend(orig_order_surps)
 
-    for parse in orig_order_parses:
-      print(parse)
+    if(not args.dump_beam):
+      for parse in orig_order_parses:
+        print(parse)
 
-  def dump_histroy(beam_history, sents):
-    for pointer, bucket_i, beam, word_completed in beam_history:
-      print('pointer: {}, i: {}'.format(pointer, bucket_i))
-      for batch_i in range(len(beam)):
-        for b in beam[batch_i]:
-          print('beam: b_i: {}, {}'.format(batch_i, b.dump(action_dict, sents[batch_i])))
-        for b in word_completed[batch_i]:
-          print('word_comp: b_i: {}, {}'.format(batch_i, b.dump(action_dict, sents[batch_i])))
-        print()
+  
+  def dump_histroy(beam_history, tokens, sent_id):
+    ret_str = ''
+    curr_pointer = 0
+    for parse in beam_history:
+      pointer = parse[0]
+      if(pointer != curr_pointer):
+        #print()
+        ret_str += '\n'
+        curr_pointer = pointer
+      parse_rank = parse[1]
+      parse_action_ids = parse[2]
+      parse_score = parse[3]
+      parse_preword_score = parse[4]
+      inc_tree_str = action_dict.build_tree_str(parse_action_ids, tokens, ['X' for x in range(pointer+1)])
+      ret_str += '{}\t{}\t{}\t{:.8f}\t{:.8f}\t{}\n'.format(sent_id, pointer, parse_rank, parse_score, parse_preword_score, inc_tree_str)
+      #print('{}\t{}\t{}\t{:.8f}\t{:.8f}\t{}'.format(sent_id, pointer, parse_rank, parse_score, parse_preword_score, inc_tree_str))
+    ret_str += '--------------------\n'
+    #print('--------------------')
+    return ret_str
 
   if args.particle_filter:
     def parse(tokens, subword_end_mask, return_beam_history = False, stack_size_bound = -1):
@@ -138,13 +152,12 @@ def main(args):
       return model.word_sync_beam_search(
         tokens, subword_end_mask, args.beam_size, args.word_beam_size, args.shift_size,
         return_beam_history=return_beam_history,
-        stack_size_bound=stack_size_bound)
+        stack_size_bound=stack_size_bound, sort_by_preword_probs=args.sort_by_preword_probs, temp=args.temp)
 
   def try_parse(tokens, subword_end_mask, stack_size_bound = None):
     stack_size_bound = args.stack_size_bound if stack_size_bound is None else -1
     if args.dump_beam:
       parses, surprisals, beam_history = parse(tokens, subword_end_mask, True, stack_size_bound)
-      dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
     else:
       parses, surprisals = parse(tokens, subword_end_mask, False, stack_size_bound)
       beam_history = None
@@ -158,13 +171,15 @@ def main(args):
     block_surprisals = []  # This is subword-based surprisal in general. Conversion to word-level surprisal is done at output phase.
     batches = [batch for batch in dataset.test_batches(
       args.block_size, max_length_diff=args.max_length_diff)]
-
-    for batch in tqdm(batches):
+    full_hist_dump = {}
+    for iter_ind, batch in enumerate(tqdm(batches)):
       tokens, subword_end_mask, batch_idx = batch
       tokens = tokens.to(device)
       subword_end_mask = subword_end_mask.to(device)
 
       parses, surprisals, beam_history = try_parse( tokens, subword_end_mask)
+      if(args.dump_beam):
+        full_hist_dump[batch_idx[0]] = dump_histroy(beam_history, dataset.sents[batch_idx[0]].orig_tokens, batch_idx[0])
       if any(len(p) == 0 for p in parses):
         # parse failure (on some tree in a batch)
         failed_sents = [(idx, " ".join(dataset.sents[idx].orig_tokens)) for p, idx
@@ -196,6 +211,9 @@ def main(args):
       block_parses.extend(trees)
       block_surprisals.extend(surprisals)
       cur_block_size += tokens.size(0)
+    if(args.dump_beam):
+      for sent_id in sorted(full_hist_dump.keys()):
+        print(full_hist_dump[sent_id])
 
       if cur_block_size >= args.block_size:
         assert cur_block_size == args.block_size

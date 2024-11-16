@@ -416,7 +416,10 @@ class BeamItems(ExpandableStorage):
 
     self.gen_ll = torch.tensor([-float('inf')], device=stack.hiddens.device).expand(
       self.batch_size, self.beam_size).clone()
+    self.gen_ll_preword = torch.tensor([-float('inf')], device=stack.hiddens.device).expand(
+      self.batch_size, self.beam_size).clone()
     self.gen_ll[:, 0] = 0
+    self.gen_ll_preword[:, 0] = 0
 
     if beam_is_empty:
         # how many beam elements are active for each batch?
@@ -450,15 +453,24 @@ class BeamItems(ExpandableStorage):
   def prev_actions(self):
     return self.action_path.prev_actions()
 
-  def nbest_parses(self, batch = None):
-    return self.action_path.nbest_parses(self.beam_widths, self.gen_ll, batch)
+  def nbest_parses(self, batch = None, preword=False):
+    if(preword):
+      return self.action_path.nbest_parses(self.beam_widths, self.gen_ll_preword, batch)
+    else:
+      return self.action_path.nbest_parses(self.beam_widths, self.gen_ll, batch)
 
-  def shrink(self, size = -1):
+  def shrink(self, size = -1, sort_by_preword_probs=False):
     size = size if size > 0 else self.beam_size
     outside_beam_idx = (torch.arange(self.beam_size, device=self.gen_ll.device).unsqueeze(0) >=
                         self.beam_widths.unsqueeze(1)).nonzero(as_tuple=True)
     self.gen_ll[outside_beam_idx] = -float('inf')
-    self.gen_ll, sort_idx = torch.sort(self.gen_ll, descending=True)
+    self.gen_ll_preword[outside_beam_idx] = -float('inf')
+    if(sort_by_preword_probs):
+      self.gen_ll_preword, sort_idx = torch.sort(self.gen_ll_preword, descending=True)
+      self.gen_ll = self.gen_ll[:, sort_idx.squeeze()]
+    else:
+      self.gen_ll, sort_idx = torch.sort(self.gen_ll, descending=True)
+      self.gen_ll_preword = self.gen_ll_preword[:, sort_idx.squeeze()]
     self.additional.sort_by(sort_idx)
     self.stack.sort_by(sort_idx)
     self.stack_state.sort_by(sort_idx)
@@ -479,7 +491,7 @@ class BeamItems(ExpandableStorage):
   def clear(self):
     self.beam_widths[:] = 0
 
-  def move_items_from(self, other, move_idxs, new_gen_ll = None,
+  def move_items_from(self, other, move_idxs, new_gen_ll = None, new_preword_gen_ll = None,
                       additional = (), allow_expand=False):
     """
 
@@ -513,6 +525,8 @@ class BeamItems(ExpandableStorage):
       move_batch_idxs, move_beam_idxs = move_idxs
       if new_gen_ll is not None:
         new_gen_ll = new_gen_ll[move_idx_mask]
+      if new_preword_gen_ll is not None:
+        new_preword_gen_ll = new_preword_gen_ll[move_idx_mask]
       additional = [score[move_idx_mask] for score in additional]
       batch_numbers = bincount_and_supply(move_batch_idxs, self.batch_size)
       max_moved_beam_size = batch_numbers.max()
@@ -526,7 +540,7 @@ class BeamItems(ExpandableStorage):
 
     self_move_idxs = (move_batch_idxs, self_move_beam_idxs)
     self.beam_widths = new_beam_widths
-    self._do_move_elements(other, self_move_idxs, move_idxs, new_gen_ll, additional)
+    self._do_move_elements(other, self_move_idxs, move_idxs, new_gen_ll, new_preword_gen_ll, additional)
 
     return self_move_idxs
 
@@ -588,9 +602,10 @@ class BeamItems(ExpandableStorage):
     self.gen_ll[active_idx_mask != 1] = -float('inf')
     return torch.logsumexp(self.gen_ll, 1)
 
-  def _do_move_elements(self, source, self_idxs, source_idxs, new_gen_ll = None,
+  def _do_move_elements(self, source, self_idxs, source_idxs, new_gen_ll = None, new_preword_gen_ll = None,
                         new_additional = ()):
     self.gen_ll[self_idxs] = new_gen_ll if new_gen_ll is not None else source.gen_ll[source_idxs]
+    self.gen_ll_preword[self_idxs] = new_preword_gen_ll if new_preword_gen_ll is not None else source.gen_ll_preword[source_idxs]
     self.additional.move_beams(self_idxs, source.additional, source_idxs, new_additional)
     self.stack_state.move_beams(self_idxs, source.stack_state, source_idxs)
     self.stack.move_beams(self_idxs, source.stack, source_idxs)
@@ -782,7 +797,7 @@ class FixedStackRNNG(nn.Module):
 
   def word_sync_beam_search(self, x, subword_end_mask, beam_size, word_beam_size = 0,
                             shift_size = 0, stack_size_bound = 100,
-                            return_beam_history = False):
+                            return_beam_history = False, sort_by_preword_probs=False, temp=1.0):
     self.eval()
     sent_lengths = (x != self.padding_idx).sum(dim=1)
     if (hasattr(self.rnng.composition, 'batch_index') and
@@ -801,7 +816,7 @@ class FixedStackRNNG(nn.Module):
 
     parses = [None] * x.size(0)
     surprisals = [[] for _ in range(x.size(0))]
-
+    batch_inc_parse_log = []
     for pointer in range(x.size(1) + 1):
       forced_completions = x.new_zeros(x.size(0), dtype=torch.long)
       bucket_i = 0
@@ -816,7 +831,7 @@ class FixedStackRNNG(nn.Module):
       while not finished_batches.all():
         added_forced_completions = self.beam_step(
           x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
-          word_completed_beam, shift_size)
+          word_completed_beam, shift_size, temp=temp)
         forced_completions += added_forced_completions
         finished_batches = word_finished_batches()
         beam.beam_widths[finished_batches.nonzero(as_tuple=True)] = 0  # inactive word-finished batches.
@@ -824,7 +839,18 @@ class FixedStackRNNG(nn.Module):
 
       self.finalize_word_completed_beam(
         x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
-        word_completed_beam, word_beam_size)
+        word_completed_beam, word_beam_size, sort_by_preword_probs=sort_by_preword_probs)
+      #print(f'step {pointer} best:', beam.nbest_parses())
+      
+      #print(pointer)
+      n_best_preword = beam.nbest_parses(preword=True)[0]
+      for parse_i_ind, parse_i in enumerate(beam.nbest_parses()[0]):
+        #print(parse_i[0], list(x[0][:pointer+1]), ['X' for x in range(pointer+1)])
+        #print((pointer, parse_i_ind, parse_i[0], parse_i[1], n_best_preword[parse_i_ind][1]))
+        batch_inc_parse_log.append((pointer, parse_i_ind, parse_i[0], parse_i[1], n_best_preword[parse_i_ind][1]))
+        #inc_tree_str = self.action_dict.build_tree_str(parse_i[0], list(x[0][:pointer+1]), ['X' for x in range(pointer+1)])
+        #print('\t', parse_i_ind, inc_tree_str, parse_i[1])
+      #print('------------')
 
       marginal = beam.marginal_probs()
       for b, s in enumerate(marginal.cpu().detach().numpy()):
@@ -836,28 +862,31 @@ class FixedStackRNNG(nn.Module):
             surprisals[b].append(-word_marginal_ll[b][i] - (-word_marginal_ll[b][i-1] if i > 0 else 0))
           parses[b] = beam.nbest_parses(b)
           beam.beam_widths[b] = 0  # inactivate finished batch
-
-    ret = (parses, surprisals)
+    if(return_beam_history):
+      ret = (parses, surprisals, batch_inc_parse_log)
+    else:
+      ret = (parses, surprisals)
     return ret
 
   def beam_step(self, x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
-                word_completed_beam, shift_size):
+                word_completed_beam, shift_size, temp=1.0):
     beam_size = beam.beam_size
     successors, word_completed_successors, added_forced_completions \
-      = self.get_successors(x, subword_end_mask, sent_lengths, pointer, beam, beam_size, shift_size)
+      = self.get_successors(x, subword_end_mask, sent_lengths, pointer, beam, beam_size, shift_size, temp=temp)
 
     # tuple of ((batch_idxs, beam_idxs), next_actions, total_scores)
-    assert len(successors) == len(word_completed_successors) == 3
+    assert len(successors) == len(word_completed_successors) == 4
 
     if word_completed_successors[0][0].size(0) > 0:
       comp_idxs = tuple(word_completed_successors[0][:2])
       # Add elements to word_completed_beam
       # This assumes that returned scores are total scores rather than the current action scores.
       moved_idxs = word_completed_beam.move_items_from(
-        beam, comp_idxs, new_gen_ll=word_completed_successors[2])
+        beam, comp_idxs, new_gen_ll=word_completed_successors[2], new_preword_gen_ll=word_completed_successors[3])
 
     new_beam_idxs, _ = beam.reconstruct(successors[0][:2])
     beam.gen_ll[new_beam_idxs] = successors[2]
+    beam.gen_ll_preword[new_beam_idxs] = successors[3]
     actions = successors[1].new_full((x.size(0), beam_size), self.action_dict.padding_idx)
     actions[new_beam_idxs] = successors[1]
     self.rnng(word_vecs, actions, beam.stack, subword_end_mask)
@@ -895,9 +924,9 @@ class FixedStackRNNG(nn.Module):
 
   def finalize_word_completed_beam(
       self, x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
-      word_completed_beam, word_beam_size):
+      word_completed_beam, word_beam_size, sort_by_preword_probs=False):
     beam_size = word_completed_beam.beam_size
-    word_completed_beam.shrink(word_beam_size)
+    word_completed_beam.shrink(word_beam_size, sort_by_preword_probs=sort_by_preword_probs)
     word_end_actions = x.new_full((x.size(0), beam_size), self.action_dict.padding_idx)
     # active_idx = word_completed_beam.active_idxs()
     # if pointer < x.size(1):  # do shift
@@ -1007,7 +1036,7 @@ class FixedStackRNNG(nn.Module):
     states = self.initial_states(x)
     return [[ParticleBeamItem.from_initial_state(state, K)] for state in states]
 
-  def get_successors(self, x, subword_end_mask, sent_lengths, pointer, beam, beam_size, shift_size):
+  def get_successors(self, x, subword_end_mask, sent_lengths, pointer, beam, beam_size, shift_size, temp=1.0):
     if pointer < x.size(1):
       next_x = x[:, pointer]
     else:
@@ -1015,12 +1044,13 @@ class FixedStackRNNG(nn.Module):
 
     invalid_action_mask = self.invalid_action_mask(beam, sent_lengths, subword_end_mask)  # (total beam size, n_actions)
 
-    log_probs = self.action_log_probs(beam.stack, invalid_action_mask, next_x)  # (batch, beam, n_actions)
+    log_probs, disc_log_probs = self.action_log_probs(beam.stack, invalid_action_mask, next_x, return_disc_probs=True, temp=temp)  # (batch, beam, n_actions)
     # scores for inactive beam items (outside active_idx) are -inf on log_probs so we need
     # not worry about values in gen_ll outside active_idx.
     log_probs += beam.gen_ll.unsqueeze(-1)
+    disc_log_probs += beam.gen_ll.unsqueeze(-1)
 
-    return self.scores_to_successors(x, sent_lengths, pointer, beam, log_probs, beam_size, shift_size)
+    return self.scores_to_successors(x, sent_lengths, pointer, beam, log_probs, beam_size, shift_size, preword_log_probs=disc_log_probs)
 
   def get_successors_by_particle_filter(self, x, subword_end_mask, sent_lengths, pointer, beam):
     if pointer < x.size(1):
@@ -1103,7 +1133,7 @@ class FixedStackRNNG(nn.Module):
     beam.move_items_from(word_completed_beam, new_active_idx, allow_expand=True)
     word_completed_beam.clear()
 
-  def action_log_probs(self, stack, invalid_action_mask, next_x = None, return_disc_probs = False):
+  def action_log_probs(self, stack, invalid_action_mask, next_x = None, return_disc_probs = False, temp= 1.0):
     """
 
     :param stack: FixedStack
@@ -1121,7 +1151,7 @@ class FixedStackRNNG(nn.Module):
       disc_log_probs = log_probs.clone()
 
     if next_x is not None:  # shift is valid for next action
-      word_logit = self.vocab_mlp(hiddens).float()  # (batch*beam, vocab_size)
+      word_logit = self.vocab_mlp(hiddens).float() / temp # (batch*beam, vocab_size)
       word_logit[:, self.padding_idx] = -float('inf')
       shift_idx = self.action_dict.a2i['SHIFT']
       next_x = next_x.unsqueeze(1).expand(-1, log_probs.size(1)).clone().view(-1)  # (batch*beam)
@@ -1193,10 +1223,13 @@ class FixedStackRNNG(nn.Module):
   def stack_top_h(self, states):
     return torch.stack([state.hiddens[-1][:, -1] for state in states], dim=0)
 
-  def scores_to_successors(self, x, sent_lengths, pointer, beam, total_scores, beam_size, shift_size):
+  def scores_to_successors(self, x, sent_lengths, pointer, beam, total_scores, beam_size, shift_size, preword_log_probs=None):
     num_actions = total_scores.size(2)
     total_scores = total_scores.view(total_scores.size(0), -1)
     sorted_scores, sort_idx = torch.sort(total_scores, descending=True)
+    if(preword_log_probs is not None):
+      total_preword_scores = preword_log_probs.view(total_scores.size(0), -1)
+      sorted_preword_scores = total_preword_scores[:, sort_idx.squeeze()]
 
     beam_id = sort_idx // num_actions
     action_id = sort_idx % num_actions
@@ -1252,7 +1285,9 @@ class FixedStackRNNG(nn.Module):
       next_beam_ids = beam_id[successor_idx]
       next_action_ids = action_id[successor_idx]
       next_scores = sorted_scores[successor_idx]
-      return (successor_idx[0], next_beam_ids), next_action_ids, next_scores
+      if(preword_log_probs is not None):
+        next_preword_scores = sorted_preword_scores[successor_idx]
+      return (successor_idx[0], next_beam_ids), next_action_ids, next_scores, next_preword_scores
 
     return (successor_idx_to_successors(no_end_successor_idx),
             successor_idx_to_successors(end_successor_idx),
@@ -1263,4 +1298,3 @@ class FixedStackRNNG(nn.Module):
     end_action_mask = action_id == self.action_dict.finish_action()
     end_action_mask = end_action_mask * pre_final_mask
     return end_action_mask
-
